@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Data (local JSON store — not committed)
+backend/data.json
+
+# Build scripts (dev only)
+write_*.py
+
+# OS
+.DS_Store
+Thumbs.db
