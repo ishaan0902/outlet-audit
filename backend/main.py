@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 import os, json, uuid
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,30 +18,96 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Storage backend ─────────────────────────────────────────────────────────
-MONGO_URL = os.getenv("MONGO_URL", "")
-USE_MONGO = bool(MONGO_URL)
+# ── Google Sheets setup ──────────────────────────────────────────────────────
+import gspread
+from google.oauth2.service_account import Credentials
 
-if USE_MONGO:
-    from motor.motor_asyncio import AsyncIOMotorClient
-    from bson import ObjectId
-    _client = AsyncIOMotorClient(MONGO_URL)
-    _db = _client[os.getenv("DB_NAME", "outlet_audit")]
-    _col = _db["audits"]
-else:
-    # JSON file store (no external deps required for local dev)
-    DATA_FILE = Path(__file__).parent / "data.json"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-    def _load_db():
-        if DATA_FILE.exists():
-            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        return []
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")  # full service account JSON as string
 
-    def _save_db(records):
-        DATA_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+_sheet_client = None
+_worksheet = None
+
+def get_worksheet():
+    global _sheet_client, _worksheet
+    if _worksheet is not None:
+        return _worksheet
+    if not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
+        raise RuntimeError("SPREADSHEET_ID and GOOGLE_CREDS_JSON env vars are required")
+    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    _sheet_client = gspread.authorize(creds)
+    spreadsheet = _sheet_client.open_by_key(SPREADSHEET_ID)
+    # Use first sheet, create headers if empty
+    ws = spreadsheet.sheet1
+    if ws.row_count == 0 or ws.cell(1, 1).value != "id":
+        ws.update("A1:I1", [["id", "outlet_name", "brand", "auditor_name", "created_at", "status", "overall_score", "parameters"]])
+        ws.format("A1:H1", {"textFormat": {"bold": True}})
+    _worksheet = ws
+    return _worksheet
 
 
-# ── Audit parameters ─────────────────────────────────────────────────────────
+def _ensure_headers(ws):
+    """Make sure header row exists."""
+    try:
+        val = ws.cell(1, 1).value
+    except Exception:
+        val = None
+    if val != "id":
+        ws.update("A1:H1", [["id", "outlet_name", "brand", "auditor_name", "created_at", "status", "overall_score", "parameters"]])
+        ws.format("A1:H1", {"textFormat": {"bold": True}})
+
+
+# ── Sheet helpers ─────────────────────────────────────────────────────────────
+COLS = ["id", "outlet_name", "brand", "auditor_name", "created_at", "status", "overall_score", "parameters"]
+
+def row_to_dict(row: list) -> dict:
+    """Convert a sheet row (list) to an audit dict."""
+    d = {}
+    for i, col in enumerate(COLS):
+        d[col] = row[i] if i < len(row) else ""
+    # Parse parameters JSON
+    try:
+        d["parameters"] = json.loads(d["parameters"]) if d["parameters"] else []
+    except Exception:
+        d["parameters"] = []
+    # Parse overall_score
+    try:
+        d["overall_score"] = float(d["overall_score"]) if d["overall_score"] not in ("", None) else None
+    except Exception:
+        d["overall_score"] = None
+    return d
+
+
+def dict_to_row(audit: dict) -> list:
+    """Convert audit dict to a flat sheet row."""
+    return [
+        audit.get("id", ""),
+        audit.get("outlet_name", ""),
+        audit.get("brand", ""),
+        audit.get("auditor_name", ""),
+        audit.get("created_at", ""),
+        audit.get("status", "in-progress"),
+        str(audit.get("overall_score", "")) if audit.get("overall_score") is not None else "",
+        json.dumps(audit.get("parameters", []), ensure_ascii=False),
+    ]
+
+
+def find_row_index(ws, audit_id: str) -> int:
+    """Return 1-based row index of audit_id, or -1 if not found."""
+    ids = ws.col_values(1)  # all values in column A
+    for i, v in enumerate(ids):
+        if v == audit_id:
+            return i + 1  # 1-based
+    return -1
+
+
+# ── Audit parameters ──────────────────────────────────────────────────────────
 PARAMETERS = [
     {"name": "Food Quality", "checkpoints": [
         "Food temperature meets safe serving standards",
@@ -137,18 +202,22 @@ PARAMETERS = [
 
 def default_parameters():
     return [
-        {"name": p["name"], "checkpoints": [
-            {"name": cp, "status": "N/A", "notes": "", "photos": []}
-            for cp in p["checkpoints"]
-        ], "score": None}
+        {
+            "name": p["name"],
+            "checkpoints": [
+                {"name": cp, "status": "N/A", "notes": "", "photos": []}
+                for cp in p["checkpoints"]
+            ],
+            "score": None,
+        }
         for p in PARAMETERS
     ]
 
 
 def calc_param_score(checkpoints):
     passes = sum(1 for c in checkpoints if c["status"] == "Pass")
-    fails = sum(1 for c in checkpoints if c["status"] == "Fail")
-    total = passes + fails
+    fails  = sum(1 for c in checkpoints if c["status"] == "Fail")
+    total  = passes + fails
     if total == 0:
         return None
     return round((passes / total) * 100, 1)
@@ -156,7 +225,7 @@ def calc_param_score(checkpoints):
 
 def calc_overall(parameters):
     scores = [calc_param_score(p["checkpoints"]) for p in parameters]
-    valid = [s for s in scores if s is not None]
+    valid  = [s for s in scores if s is not None]
     if not valid:
         return None
     return round(sum(valid) / len(valid), 1)
@@ -169,7 +238,7 @@ def enrich(audit: dict) -> dict:
     return audit
 
 
-# ── Pydantic models ──────────────────────────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 class CheckpointModel(BaseModel):
     name: str
     status: str = "N/A"
@@ -190,154 +259,105 @@ class AuditCreate(BaseModel):
 
 
 class AuditUpdate(BaseModel):
-    outlet_name: Optional[str] = None
-    brand: Optional[str] = None
-    auditor_name: Optional[str] = None
-    status: Optional[str] = None
-    parameters: Optional[List[ParameterModel]] = None
+    outlet_name:   Optional[str] = None
+    brand:         Optional[str] = None
+    auditor_name:  Optional[str] = None
+    status:        Optional[str] = None
+    parameters:    Optional[List[ParameterModel]] = None
 
 
-# ── JSON-file helpers ────────────────────────────────────────────────────────
-def _json_get_all():
-    return _load_db()
-
-def _json_get(audit_id: str):
-    records = _load_db()
-    for r in records:
-        if r["id"] == audit_id:
-            return r
-    return None
-
-def _json_insert(doc: dict):
-    records = _load_db()
-    records.insert(0, doc)
-    _save_db(records)
-
-def _json_update(audit_id: str, update_data: dict):
-    records = _load_db()
-    found = False
-    for r in records:
-        if r["id"] == audit_id:
-            r.update(update_data)
-            found = True
-            break
-    if found:
-        _save_db(records)
-    return found
-
-def _json_delete(audit_id: str):
-    records = _load_db()
-    new_records = [r for r in records if r["id"] != audit_id]
-    if len(new_records) == len(records):
-        return False
-    _save_db(new_records)
-    return True
-
-
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "storage": "mongodb" if USE_MONGO else "json"}
+    return {"status": "ok", "storage": "google_sheets"}
 
 
 @app.get("/api/audits")
 async def get_audits():
-    if USE_MONGO:
-        audits = []
-        async for doc in _col.find({}).sort("created_at", -1):
-            doc["id"] = str(doc.pop("_id"))
-            audits.append(enrich(doc))
-        return audits
-    else:
-        return [enrich(dict(a)) for a in sorted(_json_get_all(), key=lambda x: x.get("created_at", ""), reverse=True)]
+    ws = get_worksheet()
+    _ensure_headers(ws)
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= 1:
+        return []
+    # Skip header row, skip empty rows
+    audits = []
+    for row in all_rows[1:]:
+        if not row or not row[0]:
+            continue
+        audit = row_to_dict(row)
+        enrich(audit)
+        audits.append(audit)
+    # Sort newest first by created_at
+    audits.sort(key=lambda a: a.get("created_at", ""), reverse=True)
+    return audits
 
 
 @app.post("/api/audits", status_code=201)
 async def create_audit(data: AuditCreate):
+    ws = get_worksheet()
+    _ensure_headers(ws)
     now = datetime.utcnow().isoformat()
-    if USE_MONGO:
-        doc = {
-            "outlet_name": data.outlet_name, "brand": data.brand,
-            "auditor_name": data.auditor_name, "created_at": now,
-            "status": "in-progress", "overall_score": None,
-            "parameters": default_parameters(),
-        }
-        result = await _col.insert_one(doc)
-        doc["id"] = str(result.inserted_id)
-        del doc["_id"]
-        return enrich(doc)
-    else:
-        doc = {
-            "id": str(uuid.uuid4()),
-            "outlet_name": data.outlet_name, "brand": data.brand,
-            "auditor_name": data.auditor_name, "created_at": now,
-            "status": "in-progress", "overall_score": None,
-            "parameters": default_parameters(),
-        }
-        _json_insert(doc)
-        return enrich(dict(doc))
+    audit = {
+        "id":           str(uuid.uuid4()),
+        "outlet_name":  data.outlet_name,
+        "brand":        data.brand,
+        "auditor_name": data.auditor_name,
+        "created_at":   now,
+        "status":       "in-progress",
+        "overall_score": None,
+        "parameters":   default_parameters(),
+    }
+    ws.append_row(dict_to_row(audit), value_input_option="RAW")
+    return enrich(audit)
 
 
 @app.get("/api/audits/{audit_id}")
 async def get_audit(audit_id: str):
-    if USE_MONGO:
-        try:
-            oid = ObjectId(audit_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid audit ID")
-        doc = await _col.find_one({"_id": oid})
-        if not doc:
-            raise HTTPException(status_code=404, detail="Audit not found")
-        doc["id"] = str(doc.pop("_id"))
-        return enrich(doc)
-    else:
-        doc = _json_get(audit_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Audit not found")
-        return enrich(dict(doc))
+    ws = get_worksheet()
+    idx = find_row_index(ws, audit_id)
+    if idx == -1:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    row = ws.row_values(idx)
+    return enrich(row_to_dict(row))
 
 
 @app.put("/api/audits/{audit_id}")
 async def update_audit(audit_id: str, data: AuditUpdate):
+    ws = get_worksheet()
+    idx = find_row_index(ws, audit_id)
+    if idx == -1:
+        raise HTTPException(status_code=404, detail="Audit not found")
+
+    # Read existing
+    row  = ws.row_values(idx)
+    audit = row_to_dict(row)
+
+    # Apply updates
     update_data = data.model_dump(exclude_none=True)
     if "parameters" in update_data:
+        # model_dump gives dicts already
         params = update_data["parameters"]
         for p in params:
             p["score"] = calc_param_score(p["checkpoints"])
         update_data["overall_score"] = calc_overall(params)
+        audit["parameters"] = params
+        audit["overall_score"] = update_data["overall_score"]
 
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No update data provided")
+    for field in ["outlet_name", "brand", "auditor_name", "status"]:
+        if field in update_data:
+            audit[field] = update_data[field]
 
-    if USE_MONGO:
-        try:
-            oid = ObjectId(audit_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid audit ID")
-        result = await _col.update_one({"_id": oid}, {"$set": update_data})
-        if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail="Audit not found")
-        doc = await _col.find_one({"_id": oid})
-        doc["id"] = str(doc.pop("_id"))
-        return enrich(doc)
-    else:
-        if not _json_update(audit_id, update_data):
-            raise HTTPException(status_code=404, detail="Audit not found")
-        doc = _json_get(audit_id)
-        return enrich(dict(doc))
+    # Write back full row
+    new_row = dict_to_row(audit)
+    ws.update(f"A{idx}:H{idx}", [new_row])
+    return enrich(audit)
 
 
 @app.delete("/api/audits/{audit_id}", status_code=204)
 async def delete_audit(audit_id: str):
-    if USE_MONGO:
-        try:
-            oid = ObjectId(audit_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid audit ID")
-        result = await _col.delete_one({"_id": oid})
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="Audit not found")
-    else:
-        if not _json_delete(audit_id):
-            raise HTTPException(status_code=404, detail="Audit not found")
+    ws = get_worksheet()
+    idx = find_row_index(ws, audit_id)
+    if idx == -1:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    ws.delete_rows(idx)
     return None
