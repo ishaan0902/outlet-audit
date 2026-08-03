@@ -1,11 +1,27 @@
-import axios from 'axios'
+// Google Apps Script Web App URL — set VITE_SCRIPT_URL in Vercel env vars
+const SCRIPT_URL = import.meta.env.VITE_SCRIPT_URL || ''
 
-const BASE = import.meta.env.VITE_API_URL || ''
+async function get(params = {}) {
+  const url = new URL(SCRIPT_URL)
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v))
+  const r = await fetch(url.toString())
+  const data = await r.json()
+  if (data.error) throw new Error(data.error)
+  return data
+}
 
-const api = axios.create({ baseURL: BASE })
+async function post(body) {
+  const r = await fetch(SCRIPT_URL, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+  const data = await r.json()
+  if (data.error) throw new Error(data.error)
+  return data
+}
 
-export const getAudits = () => api.get('/api/audits').then(r => r.data)
-export const createAudit = (data) => api.post('/api/audits', data).then(r => r.data)
-export const getAudit = (id) => api.get(`/api/audits/${id}`).then(r => r.data)
-export const updateAudit = (id, data) => api.put(`/api/audits/${id}`, data).then(r => r.data)
-export const deleteAudit = (id) => api.delete(`/api/audits/${id}`)
+export const getAudits = () => get()
+export const getAudit = (id) => get({ action: 'get', id })
+export const createAudit = (data) => post({ action: 'create', data })
+export const updateAudit = (id, data) => post({ action: 'update', id, data })
+export const deleteAudit = (id) => post({ action: 'delete', id })
