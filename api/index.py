@@ -19,66 +19,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Google Sheets setup ───────────────────────────────────────────────────────
-import gspread
-from google.oauth2.service_account import Credentials
+# ── MySQL setup ───────────────────────────────────────────────────────────────
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+DB_HOST     = os.getenv("DB_HOST", "34.100.230.30")
+DB_PORT     = os.getenv("DB_PORT", "3306")
+DB_USER     = os.getenv("DB_USER", "Dohful")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Doh$%^Isa6")
+DB_NAME     = os.getenv("DB_NAME", "DOHFUL_ANALYTICS")
 
-SPREADSHEET_ID   = os.getenv("SPREADSHEET_ID", "")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
+DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-_worksheet = None
+# NullPool is safer for serverless (Vercel) — no persistent connections
+engine = create_engine(DATABASE_URL, poolclass=NullPool)
 
-def get_worksheet():
-    global _worksheet
-    if _worksheet is not None:
-        return _worksheet
-    if not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
-        raise RuntimeError("SPREADSHEET_ID and GOOGLE_CREDS_JSON must be set")
-    creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS_JSON), scopes=SCOPES)
-    client = gspread.authorize(creds)
-    ws = client.open_by_key(SPREADSHEET_ID).sheet1
-    _ensure_headers(ws)
-    _worksheet = ws
-    return _worksheet
+def get_conn():
+    return engine.connect()
 
-def _ensure_headers(ws):
-    if ws.cell(1, 1).value != "id":
-        ws.update("A1:H1", [["id","outlet_name","brand","auditor_name","created_at","status","overall_score","parameters"]])
-        ws.format("A1:H1", {"textFormat": {"bold": True}})
+def ensure_table():
+    with get_conn() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS outlet_audits (
+                id            VARCHAR(36)  PRIMARY KEY,
+                outlet_name   VARCHAR(255) NOT NULL,
+                brand         VARCHAR(255) NOT NULL,
+                auditor_name  VARCHAR(255) NOT NULL,
+                created_at    DATETIME     NOT NULL,
+                status        VARCHAR(50)  NOT NULL DEFAULT 'in-progress',
+                overall_score FLOAT,
+                parameters    LONGTEXT
+            )
+        """))
+        conn.commit()
 
-COLS = ["id","outlet_name","brand","auditor_name","created_at","status","overall_score","parameters"]
-
-def row_to_dict(row):
-    d = {col: (row[i] if i < len(row) else "") for i, col in enumerate(COLS)}
-    try:    d["parameters"] = json.loads(d["parameters"]) if d["parameters"] else []
-    except: d["parameters"] = []
-    try:    d["overall_score"] = float(d["overall_score"]) if d["overall_score"] not in ("", None) else None
-    except: d["overall_score"] = None
-    return d
-
-def dict_to_row(audit):
-    return [
-        audit.get("id",""),
-        audit.get("outlet_name",""),
-        audit.get("brand",""),
-        audit.get("auditor_name",""),
-        audit.get("created_at",""),
-        audit.get("status","in-progress"),
-        str(audit["overall_score"]) if audit.get("overall_score") is not None else "",
-        json.dumps(audit.get("parameters",[]), ensure_ascii=False),
-    ]
-
-def find_row(ws, audit_id):
-    ids = ws.col_values(1)
-    for i, v in enumerate(ids):
-        if v == audit_id:
-            return i + 1
-    return -1
+# Create table on startup (safe — IF NOT EXISTS)
+try:
+    ensure_table()
+except Exception as e:
+    print(f"Warning: could not ensure table: {e}")
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 PARAMETERS = [
@@ -115,6 +94,16 @@ def enrich(audit):
     audit["overall_score"] = calc_overall(audit.get("parameters", []))
     return audit
 
+def row_to_dict(row):
+    d = dict(row._mapping)
+    try:
+        d["parameters"] = json.loads(d["parameters"]) if d["parameters"] else []
+    except:
+        d["parameters"] = []
+    if isinstance(d.get("created_at"), datetime):
+        d["created_at"] = d["created_at"].isoformat()
+    return d
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class CheckpointModel(BaseModel):
     name: str
@@ -142,20 +131,16 @@ class AuditUpdate(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "storage": "google_sheets"}
+    return {"status": "ok", "storage": "mysql"}
 
 @app.get("/api/audits")
 async def get_audits():
-    ws = get_worksheet()
-    rows = ws.get_all_values()
-    if len(rows) <= 1:
-        return []
-    audits = [enrich(row_to_dict(r)) for r in rows[1:] if r and r[0]]
-    return sorted(audits, key=lambda a: a.get("created_at", ""), reverse=True)
+    with get_conn() as conn:
+        rows = conn.execute(text("SELECT * FROM outlet_audits ORDER BY created_at DESC")).fetchall()
+    return [enrich(row_to_dict(r)) for r in rows]
 
 @app.post("/api/audits", status_code=201)
 async def create_audit(data: AuditCreate):
-    ws = get_worksheet()
     audit = {
         "id": str(uuid.uuid4()),
         "outlet_name": data.outlet_name,
@@ -166,44 +151,83 @@ async def create_audit(data: AuditCreate):
         "overall_score": None,
         "parameters": default_parameters(),
     }
-    ws.append_row(dict_to_row(audit), value_input_option="RAW")
+    with get_conn() as conn:
+        conn.execute(text("""
+            INSERT INTO outlet_audits
+                (id, outlet_name, brand, auditor_name, created_at, status, overall_score, parameters)
+            VALUES
+                (:id, :outlet_name, :brand, :auditor_name, :created_at, :status, :overall_score, :parameters)
+        """), {
+            **audit,
+            "parameters": json.dumps(audit["parameters"], ensure_ascii=False),
+        })
+        conn.commit()
     return enrich(audit)
 
 @app.get("/api/audits/{audit_id}")
 async def get_audit(audit_id: str):
-    ws = get_worksheet()
-    idx = find_row(ws, audit_id)
-    if idx == -1:
+    with get_conn() as conn:
+        row = conn.execute(
+            text("SELECT * FROM outlet_audits WHERE id = :id"), {"id": audit_id}
+        ).fetchone()
+    if row is None:
         raise HTTPException(status_code=404, detail="Audit not found")
-    return enrich(row_to_dict(ws.row_values(idx)))
+    return enrich(row_to_dict(row))
 
 @app.put("/api/audits/{audit_id}")
 async def update_audit(audit_id: str, data: AuditUpdate):
-    ws = get_worksheet()
-    idx = find_row(ws, audit_id)
-    if idx == -1:
-        raise HTTPException(status_code=404, detail="Audit not found")
-    audit = row_to_dict(ws.row_values(idx))
-    update_data = data.model_dump(exclude_none=True)
-    if "parameters" in update_data:
-        params = update_data["parameters"]
-        for p in params:
-            p["score"] = calc_param_score(p["checkpoints"])
-        audit["parameters"] = params
-        audit["overall_score"] = calc_overall(params)
-    for field in ["outlet_name", "brand", "auditor_name", "status"]:
-        if field in update_data:
-            audit[field] = update_data[field]
-    ws.update(f"A{idx}:H{idx}", [dict_to_row(audit)])
+    with get_conn() as conn:
+        row = conn.execute(
+            text("SELECT * FROM outlet_audits WHERE id = :id"), {"id": audit_id}
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Audit not found")
+
+        audit = row_to_dict(row)
+        update_data = data.model_dump(exclude_none=True)
+
+        if "parameters" in update_data:
+            params = update_data["parameters"]
+            for p in params:
+                p["score"] = calc_param_score(p["checkpoints"])
+            audit["parameters"] = params
+            audit["overall_score"] = calc_overall(params)
+
+        for field in ["outlet_name", "brand", "auditor_name", "status"]:
+            if field in update_data:
+                audit[field] = update_data[field]
+
+        conn.execute(text("""
+            UPDATE outlet_audits
+            SET outlet_name   = :outlet_name,
+                brand         = :brand,
+                auditor_name  = :auditor_name,
+                status        = :status,
+                overall_score = :overall_score,
+                parameters    = :parameters
+            WHERE id = :id
+        """), {
+            "id": audit_id,
+            "outlet_name": audit["outlet_name"],
+            "brand": audit["brand"],
+            "auditor_name": audit["auditor_name"],
+            "status": audit["status"],
+            "overall_score": audit.get("overall_score"),
+            "parameters": json.dumps(audit["parameters"], ensure_ascii=False),
+        })
+        conn.commit()
+
     return enrich(audit)
 
 @app.delete("/api/audits/{audit_id}", status_code=204)
 async def delete_audit(audit_id: str):
-    ws = get_worksheet()
-    idx = find_row(ws, audit_id)
-    if idx == -1:
+    with get_conn() as conn:
+        result = conn.execute(
+            text("DELETE FROM outlet_audits WHERE id = :id"), {"id": audit_id}
+        )
+        conn.commit()
+    if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Audit not found")
-    ws.delete_rows(idx)
     return None
 
 # Vercel serverless handler
